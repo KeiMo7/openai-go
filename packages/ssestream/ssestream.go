@@ -43,6 +43,40 @@ func NewDecoder(res *http.Response) Decoder {
 
 	scn := bufio.NewScanner(res.Body)
 	scn.Buffer(nil, bufio.MaxScanTokenSize<<9)
+	decoder := &eventStreamDecoder{rc: res.Body, scn: scn}
+
+	// Opt-in recovery: only when the request context carries an enabled
+	// configuration does the decoder gain resumable semantics. Decoders built
+	// for renewed connections already own recovery and are not rewrapped.
+	// Every other path returns the plain decoder, preserving existing
+	// behavior exactly.
+	if factory := resumableFactoryFromRegistry(); factory != nil && res.Request != nil {
+		if wrapped, ok := factory(res.Request.Context(), res, decoder, newPlainDecoder); ok {
+			return wrapped
+		}
+	}
+	return decoder
+}
+
+// newPlainDecoder builds a decoder without consulting the recovery registry,
+// so a renewed physical connection cannot be wrapped a second time.
+func newPlainDecoder(res *http.Response) Decoder {
+	if res == nil || res.Body == nil {
+		return nil
+	}
+
+	contentType, mediaType := decoderContentTypes(res.Header.Get("content-type"))
+	if t, ok := decoderTypes[contentType]; ok {
+		return t(res.Body)
+	}
+	if mediaType != "" {
+		if t, ok := decoderTypes[mediaType]; ok {
+			return t(res.Body)
+		}
+	}
+
+	scn := bufio.NewScanner(res.Body)
+	scn.Buffer(nil, bufio.MaxScanTokenSize<<9)
 	return &eventStreamDecoder{rc: res.Body, scn: scn}
 }
 
@@ -66,6 +100,9 @@ func decoderContentTypes(contentType string) (string, string) {
 type Event struct {
 	Type string
 	Data []byte
+	// ID is the last "id:" field of the event, per the Server-Sent Events
+	// wire format. It is empty when the event carries no id field.
+	ID string
 }
 
 // StreamError represents an error event that occurred during streaming,
@@ -94,6 +131,7 @@ func (s *eventStreamDecoder) Next() bool {
 
 	event := ""
 	var data []byte
+	id := ""
 
 	for s.scn.Scan() {
 		txt := s.scn.Bytes()
@@ -102,11 +140,13 @@ func (s *eventStreamDecoder) Next() bool {
 		if len(txt) == 0 {
 			if len(data) == 0 {
 				event = ""
+				id = ""
 				continue
 			}
 			s.evt = Event{
 				Type: event,
 				Data: data,
+				ID:   id,
 			}
 			return true
 		}
@@ -125,6 +165,8 @@ func (s *eventStreamDecoder) Next() bool {
 			continue
 		case "event":
 			event = string(value)
+		case "id":
+			id = string(value)
 		case "data":
 			data = append(data, value...)
 			data = append(data, '\n')
@@ -255,10 +297,11 @@ func (s *Stream[T]) Next() bool {
 	}
 
 	if !decoder.Next() {
-		// decoder.Next() may be false because of an error
+		// decoder.Next() may be false because of an error; a resumable decoder
+		// returns a nil error here when its upstream terminal marker ended the
+		// stream, so finish(nil) produces the same clean end as a plain stream.
 		return s.finish(decoder.Err())
 	}
-
 	event := decoder.Event()
 	if bytes.HasPrefix(event.Data, []byte("[DONE]")) {
 		return s.finish(nil)

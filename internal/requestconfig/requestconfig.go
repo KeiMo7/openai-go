@@ -23,6 +23,7 @@ import (
 	"github.com/openai/openai-go/v3/internal/apierror"
 	"github.com/openai/openai-go/v3/internal/apiform"
 	"github.com/openai/openai-go/v3/internal/apiquery"
+	"github.com/openai/openai-go/v3/internal/streamconfig"
 	"github.com/tidwall/gjson"
 )
 
@@ -310,6 +311,20 @@ func NewRequestConfig(ctx context.Context, method string, u string, body any, ds
 	// This must run after `cfg.Apply(...)` above so we know which specific security scheme to add
 	ApplySecurity(cfg)
 
+	// Opt-in stream recovery travels on the request context so the SSE layer
+	// can discover it without changing any public streaming method signature.
+	// Disabled configs leave the context untouched.
+	if cfg.StreamRecovery.Enabled {
+		cfg.Request = cfg.Request.WithContext(streamconfig.WithContext(cfg.Request.Context(), cfg.StreamRecovery))
+	}
+	// The configuration itself rides the context so the recovery opener can
+	// build authenticated renewal requests from the same template.
+	cfg.Request = cfg.Request.WithContext(WithRequestConfig(cfg.Request.Context(), &cfg))
+	// Remember the caller's root context for renewal clones: a failed
+	// connection's request-scoped context may already be done, but a renewal
+	// must run on the caller context with fresh per-attempt timeouts.
+	cfg.rootContext = ctx
+
 	// This must run after `cfg.Apply(...)` above in case the request timeout gets modified. We also only
 	// apply our own logic for it if it's still "0" from above. If it's not, then it was deleted or modified
 	// by the user and we should respect that.
@@ -336,10 +351,12 @@ type HTTPDoer interface {
 // composing the RequestOption instead if possible.
 type RequestConfig struct {
 	WebSocketRecovery          websocket.RecoveryOptions
+	StreamRecovery             streamconfig.Config
 	MaxRetries                 int
 	MaxRetryDelay              time.Duration
 	RequestTimeout             time.Duration
 	Context                    context.Context
+	rootContext                context.Context
 	Request                    *http.Request
 	BaseURL                    *url.URL
 	endpointSelector           string
@@ -371,6 +388,11 @@ type RequestConfig struct {
 	// given address
 	ResponseInto **http.Response
 	Body         io.Reader
+
+	// streamRawErrorResponse keeps a >=400 response as a raw *http.Response
+	// instead of coercing it into an APIError. The stream recovery opener uses
+	// it so the recovery controller can classify the status itself. Internal.
+	streamRawErrorResponse bool
 }
 
 // middleware is exactly the same type as the Middleware type found in the [option] package,
@@ -745,7 +767,7 @@ func (cfg *RequestConfig) Execute() (err error) {
 		return err
 	}
 
-	if res.StatusCode >= 400 {
+	if res.StatusCode >= 400 && !cfg.streamRawErrorResponse {
 		contents, readErr := io.ReadAll(res.Body)
 		_ = res.Body.Close()
 		if readErr != nil {
